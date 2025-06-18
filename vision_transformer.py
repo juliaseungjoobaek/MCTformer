@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from functools import partial
+import torch.nn.functional as F
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.helpers import load_pretrained
@@ -51,7 +52,7 @@ default_cfgs = {
 }
 
 
-class Mlp(nn.Module):
+class Mlp(nn.Module): #Replace into MoE
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
         out_features = out_features or in_features
@@ -69,6 +70,34 @@ class Mlp(nn.Module):
         x = self.drop(x)
         return x
 
+
+class MoE(nn.Module): #Replace MLP layers
+    def __init__(self, in_features, hidden_features=None, out_features=None, num_experts=8, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.num_experts = num_experts
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(in_features, hidden_features),
+                act_layer(),
+                nn.Dropout(drop),
+                nn.Linear(hidden_features, out_features),
+                nn.Dropout(drop)
+            ) for _ in range(num_experts)
+        ])
+        self.gate = nn.Linear(in_features, num_experts)
+
+    def forward(self, x):
+        # x: [B, T, D]
+        gate_scores = F.softmax(self.gate(x), dim=-1)  # [B, T, num_experts]
+        out = 0
+        for i, expert in enumerate(self.experts):
+            expert_out = expert(x)  # [B, T, D]
+            gate_weight = gate_scores[..., i].unsqueeze(-1)  # [B, T, 1]
+            out += expert_out * gate_weight
+        return out
+# further task: baseline 확인 후 -> node balancing loss 
 
 class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., num_classes=20):
@@ -106,7 +135,8 @@ class Attention(nn.Module):
 class Block(nn.Module):
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, num_classes=20):
+                drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, num_classes=20,
+                use_moe=False, num_experts=8):  # ← add these 2
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(
@@ -115,7 +145,13 @@ class Block(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        #self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        if use_moe:
+            self.mlp = MoE(in_features=dim, hidden_features=mlp_hidden_dim, 
+                        num_experts=num_experts, act_layer=act_layer, drop=drop)
+        else:
+            self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, 
+                        act_layer=act_layer, drop=drop)
 
     def forward(self, x):
         o, weights = self.attn(self.norm1(x))
@@ -164,8 +200,13 @@ class VisionTransformer(nn.Module):
         self.blocks = nn.ModuleList([
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, num_classes=num_classes)
-            for i in range(depth)])
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i],
+                norm_layer=norm_layer, num_classes=num_classes,
+                use_moe=(i >= depth // 2),     # ← Only use MoE in deeper layers
+                num_experts=8                  # ← Customize expert count
+            )
+            for i in range(depth)
+        ])
         self.norm = norm_layer(embed_dim)
         # Classifier head
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()

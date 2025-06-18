@@ -1,1 +1,3 @@
 VOCdevkit/
+voc12/VOCtrainval_11-May-2012.tar
+voc12/*.tar

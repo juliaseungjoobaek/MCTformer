@@ -165,7 +165,7 @@ def main(args):
 
     print(args)
 
-    device = torch.device(args.device)
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
     # same_seeds(0)
     seed = args.seed
